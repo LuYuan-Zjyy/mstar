@@ -187,6 +187,8 @@ class CapturedResidentStep:
     block_table: ResidentTable | None = None
     # set by an owner whose kernel runs off the tables alone: nothing plans this bucket
     host_plan_free: bool = False
+    # set by attention that builds its page arrays in the graph: the host plans lengths only
+    lengths_only: bool = False
 
 
 class ResidentPlanner:
@@ -210,6 +212,9 @@ class ResidentPlanner:
         self._buffers: dict[tuple[BucketKey, int], ResidentBuffers] = {}
         # buckets whose steps need no host plan at all
         self.host_plan_free: set[BucketKey] = set()
+        # buckets whose attention reads its pages off the tables: the KV plan
+        # hands it host lengths and no page indices
+        self.lengths_only: set[BucketKey] = set()
 
         self._lock = threading.Lock()
         # rid -> slot. Handle-keyed: `release` purges it.
@@ -504,6 +509,8 @@ class ResidentPlanner:
             resource.resident_gather(step)
         if step.host_plan_free:
             self.host_plan_free.add(step.bucket)
+        elif step.lengths_only:
+            self.lengths_only.add(step.bucket)
 
     def commit_in_graph(self, step: CapturedResidentStep) -> None:
         for resource in self._owners:
