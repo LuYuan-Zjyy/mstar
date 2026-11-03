@@ -19,8 +19,8 @@ forward) and then hangs in the collective. So:
   drops a head without building it (the verdicts on which the leader clears
   its own speculation before threading), unless the prefix cache is open,
   where the leader pre-planned the head and the follower builds it too;
-* a step whose forward raised is closed (``_close_tp_follow_step``): its head
-  is dropped, queued or arriving.
+* a step whose forward raised is closed (``_close_tp_follow_step``): a head
+  from it, queued or arriving later, becomes a step of moves alone.
 
 Drives the real ``Worker`` methods unbound on a minimal stub with a real
 ``MicroScheduler`` for the FIFO, the pattern ``test_worker_message_handling``
@@ -269,20 +269,33 @@ def test_nospec_marker_is_recorded_and_never_queued():
     assert s.scheduler.peek_tp_follow() is None
 
 
-def test_head_for_a_closed_step_is_dropped_on_arrival():
+def test_a_head_for_a_closed_step_is_queued_as_a_step_of_moves_alone():
+    """Rank 0 made the head's moves, and stamps the removals it makes next with the head's seq, before it
+    learns the step failed."""
     s = _stub()
     s._close_tp_follow_step(_pending(4))
     s._register_tp_follow(_head(["r0"], seq=5, from_seq=4))
-    assert s.scheduler.peek_tp_follow() is None
+
+    head = s.scheduler.peek_tp_follow()
+    assert head is not None and (head.spec_seq, head.request_ids, head.speculative) == (5, [], False), (
+        "the follower skipped rank 0's step"
+    )
 
 
-def test_close_drops_an_already_queued_head_for_that_step_only():
+def test_close_turns_a_queued_head_for_that_step_only_into_a_step_of_moves_alone():
     s = _stub()
     other = _head(["r9"], seq=9, from_seq=8)
     s.scheduler.register_tp_follow(_head(["r0"], seq=5, from_seq=4))
     s.scheduler.register_tp_follow(other)
+
     s._close_tp_follow_step(_pending(4))
-    assert s.scheduler.peek_tp_follow() is other
+
+    head = s.scheduler.peek_tp_follow()
+    assert (head.spec_seq, head.request_ids, head.speculative) == (5, [], False), (
+        "the close took the step's head off the queue"
+    )
+    assert s.scheduler.tp_batches_pending_schedule[1] is other, "the close voided a head from another step"
+    assert "r0" not in s.scheduler.pending_tp_follow_count, "the voided head's rows still hold the drain"
 
 
 def test_plain_and_unrelated_speculative_messages_queue_normally():

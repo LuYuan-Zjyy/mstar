@@ -389,6 +389,14 @@ def unfinished_chunk_rids(chunk_ranges: Mapping[int, ChunkRange]) -> set[int]:
     return {rid for rid, chunk in chunk_ranges.items() if not runs_final_chunk(chunk)}
 
 
+def moves_alone(message: ScheduleTPNode) -> ScheduleTPNode:
+    """A step with ``message``'s seq and rank 0's moves, and no rows to build."""
+    return ScheduleTPNode(
+        message.node_name, message.graph_walk, [],
+        spec_seq=message.spec_seq, resident_delta=message.resident_delta,
+    )
+
+
 def _pre_existing_tokens(seq_lens: Collection[int], n: int) -> int:
     """The tokens a speculation chain's own ``n`` rows will run, as the
     submodule estimates them (``speculative_input_seq_len``): their inputs do
@@ -856,18 +864,29 @@ class MicroScheduler:
 
     def pop_tp_follow_head(self) -> ScheduleTPNode:
         # Sole exit for a queued follow batch: every consumer (the serial path
-        # and the async follower's build / drop / void paths) pops here, so the
-        # drain refcount is discharged in one place.
+        # and the async follower's build and drop paths) pops here. `void_tp_follow_head`
+        # also discharges the drain refcount, for the head of a step whose forward raised.
         message = self.tp_batches_pending_schedule.popleft()
         self._apply_delta_from_message(message)
         self._last_popped_tp_seq = max(self._last_popped_tp_seq, message.spec_seq)
-        for rid in message.request_ids:
+        self._discharge(message.request_ids)
+        return message
+
+    def void_tp_follow_head(self) -> None:
+        """Turn the front head, which this rank won't build, into a step of moves alone. Rank 0 made the head's
+        moves and stamps the removals it makes next with the head's seq, so the seq counts as consumed only when
+        the step is popped, after its moves land."""
+        head = self.tp_batches_pending_schedule[0]
+        self._discharge(head.request_ids)
+        self.tp_batches_pending_schedule[0] = moves_alone(head)
+
+    def _discharge(self, rids: list[str]) -> None:
+        for rid in rids:
             if rid not in self.pending_tp_follow_count:
                 continue
             self.pending_tp_follow_count[rid] -= 1
             if self.pending_tp_follow_count[rid] <= 0:
                 self.pending_tp_follow_count.pop(rid, None)
-        return message
 
     def pop_ready_rids(
         self, request_state: RequestStateManager,
@@ -952,6 +971,10 @@ class MicroScheduler:
         # leader's graph walk. No step of the node is in flight on this path.
         if not self.settle_tp_follow_delta(caught_up=True):
             return # every pending move has to land before the step is built
+        if not first_tp_node.request_ids:
+            # a step with no rows, so pop it rather than build an empty batch
+            self.pop_tp_follow_head()
+            return
         rids = self.tp_rids(first_tp_node)
         # before anything is popped: lists that do not match the rows raise
         chunk_ranges = tp_chunk_ranges(first_tp_node, rids)

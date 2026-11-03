@@ -113,6 +113,7 @@ from mstar.worker.executing_batch import input_metadata_and_fwd_info, make_execu
 from mstar.worker.micro_scheduler import (
     MicroScheduler,
     ScheduledBatch,
+    moves_alone,
     tp_chunk_ranges,
     unfinished_chunk_rids,
 )
@@ -3348,7 +3349,7 @@ class Worker:
             self._tp_nospec.add(message.spec_from_seq)
 
     def _register_tp_follow(self, message: ScheduleTPNode) -> None:
-        """Queue a ScheduleTPNode; drop a head for a step this rank closed."""
+        """Queue a ScheduleTPNode. A head for a step this rank closed is queued as a step of moves alone."""
         if not message.request_ids:
             logger.warning(
                 "Worker %s: dropped empty ScheduleTPNode for %s/%s (seq %d)",
@@ -3361,21 +3362,21 @@ class Worker:
             and message.spec_from_seq in self._tp_nospec
         ):
             logger.debug(
-                "Worker %s: dropped speculative head seq %d (parent %d closed)",
+                "Worker %s: kept only the moves of speculative head seq %d (parent %d closed)",
                 self.worker_id, message.spec_seq, message.spec_from_seq,
             )
-            return
+            message = moves_alone(message)
         self.scheduler.register_tp_follow(message)
 
     def _close_tp_follow_step(self, pending: PendingBatch) -> None:
         """This step's forward raised (symmetrically on the leader, which never
-        submitted its head): drop a queued head from it, and any arriving later."""
+        submitted its head): a head from it, queued or arriving later, becomes a step of moves alone."""
         self._tp_nospec.add(pending.tp_seq)
         head = self.scheduler.peek_tp_follow()
         if head is not None and head.speculative and head.spec_from_seq == pending.tp_seq:
-            self.scheduler.pop_tp_follow_head()
             # settle may have adopted some of the head's hit, and the leader releases the whole lease
             self.engine_manager.get_engine(head.node_name).drop_cached_prefix(head)
+            self.scheduler.void_tp_follow_head()
 
     @staticmethod
     def _step_voids_head(pending: PendingBatch) -> str | None:
