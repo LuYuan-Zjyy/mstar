@@ -122,7 +122,6 @@ def test_crashed_forward_fails_the_whole_batch():
     executor = ThreadPoolExecutor(max_workers=1)
     try:
         w = _worker()
-        w._in_flight_rids = {"r1"}
         pending = _pending_batch(["r1"], future=executor.submit(lambda: 1 / 0))
         try:
             pending.future.result()
@@ -154,7 +153,6 @@ def test_error_handler_drains_the_speculative_batch_still_on_the_gpu():
 
     try:
         w = _worker()
-        w._in_flight_rids = set()
         spec = _pending_batch(["r2"], future=executor.submit(_slow))
         started.wait(10)
         release.set()
@@ -167,15 +165,14 @@ def test_error_handler_drains_the_speculative_batch_still_on_the_gpu():
         executor.shutdown(wait=True)
 
 
-def test_error_handler_also_fails_the_batch_built_this_iteration():
+def test_error_handler_fails_the_batch_built_this_iteration():
     w = _worker()
-    w._in_flight_rids = {"r1"}
     scheduled = ScheduledBatch(
         node_name="node", graph_walk="walk",
         request_to_worker_graph={"r2": "wg"},
     )
     w._handle_main_loop_error(RuntimeError("boom"), (None, None), scheduled)
-    assert set(w.sent[0][1].body.errors) == {"r1", "r2"}
+    assert set(w.sent[0][1].body.errors) == {"r2"}
 
 
 # ── api server ─────────────────────────────────────────────────────────────

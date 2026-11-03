@@ -81,6 +81,16 @@ def _speculation(plan_future, *rids: str, continuing=()) -> worker_mod.Speculati
     )
 
 
+def _pending(*rids: str) -> SimpleNamespace:
+    """Step N, as the main loop hands it to the error handler."""
+    return SimpleNamespace(
+        batch=ScheduledBatch(
+            node_name="dit", graph_walk="w", request_to_worker_graph={rid: 0 for rid in rids},
+        ),
+        future=None, node_name="dit",
+    )
+
+
 def _done_future(value=True) -> Future:
     fut: Future = Future()
     fut.set_result(value)
@@ -98,12 +108,11 @@ def test_main_loop_error_drops_an_armed_unsubmitted_speculation() -> None:
     the plan future is drained, the stage dropped through the engine, the
     fresh rid goes back to its queue and the continuing rid fails with N."""
     w = _fake_worker()
-    w._in_flight_rids = {"a"}
     spec = _speculation(_done_future(), "a", "b", continuing=("a",))
-    Worker._handle_main_loop_error(w, RuntimeError("boom"), (None, None), None, spec)
+    Worker._handle_main_loop_error(w, RuntimeError("boom"), (_pending("a"), None), None, spec)
     assert w.resets == [spec.node_batch]
     assert spec.plan_future is None
-    assert sorted(w.despeculated) == ["a", "b"]
+    assert sorted(w.despeculated) == ["a", "a", "b"]
     assert w.pushed_back == ["b"]
     assert list(w.failed[0]) == ["a"] and len(w.failed) == 1
     assert w.failed[0]["a"].startswith("Error in worker: internal error (error id ")

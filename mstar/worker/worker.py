@@ -4560,15 +4560,16 @@ class Worker:
         batch: ScheduledBatch | None,
         speculation: "Speculation | None" = None,
     ) -> None:
-        """Fail everything the crashed iteration touched and drain its futures.
+        """Fail the rows of the steps the crashed pass held and drain their futures.
 
         Attribution is batch-granular here: a raise out of the forward, the
         batch build, or output routing can't be pinned on one request (the
         stages that *can* attribute report through
-        ``ExecutingBatch.failed_requests`` instead), so every rid this iteration
-        touched fails together. Sequential retry of the batch — see the design
-        discussion on #123 — would go here; today a batch-level crash is
-        terminal for its rids.
+        ``ExecutingBatch.failed_requests`` instead), so the rows of the pending
+        step, a submitted speculation and the batch built this pass fail
+        together, and an unsubmitted speculation's fresh rows go back.
+        Sequential retry of the batch — see the design discussion on #123 —
+        would go here; today a batch-level crash is terminal for its rids.
 
         The caller still has to clear its own in-flight state; see the main
         loop's handler.
@@ -4581,7 +4582,7 @@ class Worker:
             exc, f"Worker {self.worker_id} error in main loop", log=logger,
         )
 
-        failed_rids: set[int] = set(self._in_flight_rids)
+        failed_rids: set[int] = set()
         for stale in in_flight:
             if stale is None:
                 continue

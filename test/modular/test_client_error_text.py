@@ -19,7 +19,7 @@ from mstar.api_server import entrypoint
 from mstar.api_server.rust_frontend import RustFrontendBridge
 from mstar.engine.engine import ExecutingBatch
 from mstar.utils.ipc_format import ConductorMessageType
-from mstar.worker.micro_scheduler import MicroScheduler
+from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.worker import Worker
 
 USER = getpass.getuser()
@@ -119,14 +119,14 @@ def _worker(rids=("r1",)):
     w.scheduler.held_until = {}
     w.scheduler.admit_errors = {}
     w.scheduler.backlog = {}
-    w._in_flight_rids = set(rids)
     return w
 
 
 def test_a_worker_exception_reaches_the_client_as_an_error_id(tmp_path, caplog):
     tensor_file = f"{tmp_path}/mstar_tensors_{USER}/r1_audio.pt"
     w = _worker()
-    w._handle_main_loop_error(FileNotFoundError(f"cannot open {tensor_file}"), (None, None), None)
+    batch = ScheduledBatch(node_name="talker", graph_walk="decode", request_to_worker_graph={"r1": 0})
+    w._handle_main_loop_error(FileNotFoundError(f"cannot open {tensor_file}"), (None, None), batch)
 
     (message,) = w.sent
     text = message.body.errors["r1"]
