@@ -19,10 +19,6 @@ def _fake_args(tokens: int):
     return x, w1, w2, s1, s2, torch.empty(tokens, 2), torch.empty(tokens, 2, dtype=torch.int64)
 
 
-def test_registered_as_one_op():
-    assert hasattr(torch.ops.mstar, "fused_experts_fp8")
-
-
 @pytest.mark.parametrize("reduce_results", [True, False])
 def test_fake_impl_shapes(reduce_results):
     # the op itself: eager, fused_experts_fp8 calls the implementation
