@@ -43,19 +43,35 @@ def test_get_config_uses_nearest_batch_and_down_overrides(tuned_table):
     assert kernels.get_config(M=50, E=8, N=64, K=32, top_k=2)[0]["BLOCK_SIZE_M"] == 64
 
 
-def test_a_traced_launch_drops_the_tuned_warps_and_stages():
-    """The table lookup graph-breaks, so under a dynamic compile the config
-    reaches the launch with symbolic ints, which Triton takes only as constants."""
-    tile = {"BLOCK_SIZE_M": 16, "num_warps": 4, "num_stages": 3}
+@pytest.mark.parametrize("reduce_results", [True, False])
+def test_a_dynamic_compile_keeps_fused_experts_opaque(reduce_results):
+    """Traced, the launch would take the tuned table's ints as symbols, which Triton
+    takes only as constants; one opaque op runs every launch eagerly instead. The
+    backend never runs the graph, so this needs no GPU."""
+    from mstar.utils.fused_moe import fused_experts
 
-    def lookup():
-        torch._dynamo.graph_break()
-        return dict(tile)
+    experts, hidden, inter, top_k = 4, 32, 16, 2
+    bf16 = dict(dtype=torch.bfloat16)
+    w1, w2 = torch.zeros(experts, 2 * inter, hidden, **bf16), torch.zeros(experts, hidden, inter, **bf16)
+    graphs = []
+
+    def record(gm, example_inputs):
+        graphs.append(gm)
+        return lambda *args: (torch.empty(0),)
 
     torch._dynamo.reset()
-    launch = torch.compile(lambda x: x + len(kernels._launch_options(lookup())), dynamic=True, backend="eager")
-    assert launch(torch.zeros(4)).tolist() == [1.0] * 4
-    assert kernels._launch_options(dict(tile)) == tile
+    run = torch.compile(
+        lambda x, w, i: fused_experts(x, w1, w2, w, i, reduce_results=reduce_results),
+        backend=record, dynamic=True, fullgraph=True,
+    )
+    for tokens in (3, 5):
+        run(torch.zeros(tokens, hidden, **bf16), torch.zeros(tokens, top_k, **bf16),
+            torch.zeros(tokens, top_k, dtype=torch.int64))
+    (graph,) = graphs  # one graph for every token count
+    calls = [n for n in graph.graph.nodes if n.op == "call_function"]
+    assert [n.target for n in calls] == [torch.ops.mstar.fused_experts]
+    shape = calls[0].meta["example_value"].shape
+    assert len(shape) == (2 if reduce_results else 3)
 
 
 @CUDA

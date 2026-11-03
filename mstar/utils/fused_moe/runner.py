@@ -102,6 +102,31 @@ def fused_experts(
         Shape ``(tokens, hidden)`` if ``reduce_results`` else
         ``(tokens, top_k, hidden)``.
     """
+    sorted_token_ids, expert_ids, num_tokens_post_padded, block_m = alignment or (None,) * 4
+    return torch.ops.mstar.fused_experts(
+        hidden_states, w1, w2, topk_weights, topk_ids, activation, reduce_results, skip_invalid,
+        sorted_token_ids, expert_ids, num_tokens_post_padded, block_m,
+    )
+
+
+# One opaque op to dynamo, as fused_experts_fp8: every launch then runs eagerly with
+# concrete ints, so the tuned table's num_warps / num_stages reach Triton, which takes
+# launch options only as constants, on a dynamic or captured trace too.
+@torch.library.custom_op("mstar::fused_experts", mutates_args=())
+def _fused_experts_op(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    activation: str,
+    reduce_results: bool,
+    skip_invalid: bool,
+    sorted_token_ids: torch.Tensor | None,
+    expert_ids: torch.Tensor | None,
+    num_tokens_post_padded: torch.Tensor | None,
+    alignment_block_m: int | None,
+) -> torch.Tensor:
     assert hidden_states.is_contiguous(), "hidden_states must be contiguous"
     assert w1.is_contiguous(), "w1 must be contiguous"
     assert w2.is_contiguous(), "w2 must be contiguous"
@@ -120,7 +145,7 @@ def fused_experts(
     # moe_align_block_size expects int32; torch.topk returns int64.
     topk_ids = topk_ids.to(torch.int32).contiguous()
     topk_weights = topk_weights.contiguous()
-    if (alignment is None and not skip_invalid and activation == "silu"
+    if (sorted_token_ids is None and not skip_invalid and activation == "silu"
             and hidden_states.is_cuda and current_platform.is_cuda()):
         # imported here: it needs triton's CUDA extras, which CPU hosts may lack. Its per-pair
         # tiles target NVIDIA GPUs (swept on an H100), so ROCm keeps the grouped path.
@@ -137,10 +162,10 @@ def fused_experts(
 
     # 1. Token permute + per-expert block alignment.
     block_m = config["BLOCK_SIZE_M"]
-    if alignment is None:
-        alignment = MoeAlignment(*moe_align_block_size(topk_ids, block_m, E), block_m)
-    assert alignment.block_m == block_m, f"alignment uses BLOCK_SIZE_M={alignment.block_m}, config {block_m}"
-    sorted_token_ids, expert_ids, num_tokens_post_padded, _ = alignment
+    if sorted_token_ids is None:
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(topk_ids, block_m, E)
+    else:
+        assert alignment_block_m == block_m, f"alignment uses BLOCK_SIZE_M={alignment_block_m}, config {block_m}"
 
     # 2. Scratch buffers (all sized from static inputs -- no data-dependent shapes).
     m_topk = num_tokens * top_k
@@ -204,6 +229,15 @@ def fused_experts(
     output = torch.empty_like(hidden_states)
     moe_sum_reduce_triton(cache3, output, routed_scaling_factor=1.0)
     return output
+
+
+@_fused_experts_op.register_fake
+def _(hidden_states, w1, w2, topk_weights, topk_ids, activation, reduce_results, skip_invalid,
+      sorted_token_ids, expert_ids, num_tokens_post_padded, alignment_block_m):
+    if reduce_results:
+        return torch.empty_like(hidden_states)
+    tokens, hidden = hidden_states.shape
+    return hidden_states.new_empty((tokens, topk_ids.shape[1], hidden))
 
 
 def fused_experts_fp8(
