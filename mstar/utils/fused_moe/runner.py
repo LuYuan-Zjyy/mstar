@@ -103,10 +103,23 @@ def fused_experts(
         ``(tokens, top_k, hidden)``.
     """
     sorted_token_ids, expert_ids, num_tokens_post_padded, block_m = alignment or (None,) * 4
-    return torch.ops.mstar.fused_experts(
+    # the op only where dynamo traces; eager calls skip the custom op's dispatch
+    run = torch.ops.mstar.fused_experts if torch.compiler.is_compiling() else _fused_experts_impl
+    return run(
         hidden_states, w1, w2, topk_weights, topk_ids, activation, reduce_results, skip_invalid,
         sorted_token_ids, expert_ids, num_tokens_post_padded, block_m,
     )
+
+
+def _moe_output_like(
+    hidden_states: torch.Tensor, topk_ids: torch.Tensor, reduce_results: bool,
+) -> torch.Tensor:
+    """The fake impls' output: ``(tokens, hidden)``, or ``(tokens, top_k, hidden)``
+    without ``reduce_results``."""
+    if reduce_results:
+        return torch.empty_like(hidden_states)
+    tokens, hidden = hidden_states.shape
+    return hidden_states.new_empty((tokens, topk_ids.shape[1], hidden))
 
 
 # One opaque op to dynamo, as fused_experts_fp8: every launch then runs eagerly with
@@ -114,6 +127,32 @@ def fused_experts(
 # launch options only as constants, on a dynamic or captured trace too.
 @torch.library.custom_op("mstar::fused_experts", mutates_args=())
 def _fused_experts_op(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    activation: str,
+    reduce_results: bool,
+    skip_invalid: bool,
+    sorted_token_ids: torch.Tensor | None,
+    expert_ids: torch.Tensor | None,
+    num_tokens_post_padded: torch.Tensor | None,
+    alignment_block_m: int | None,
+) -> torch.Tensor:
+    return _fused_experts_impl(
+        hidden_states, w1, w2, topk_weights, topk_ids, activation, reduce_results, skip_invalid,
+        sorted_token_ids, expert_ids, num_tokens_post_padded, alignment_block_m,
+    )
+
+
+@_fused_experts_op.register_fake
+def _(hidden_states, w1, w2, topk_weights, topk_ids, activation, reduce_results, skip_invalid,
+      sorted_token_ids, expert_ids, num_tokens_post_padded, alignment_block_m):
+    return _moe_output_like(hidden_states, topk_ids, reduce_results)
+
+
+def _fused_experts_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
@@ -231,15 +270,6 @@ def _fused_experts_op(
     return output
 
 
-@_fused_experts_op.register_fake
-def _(hidden_states, w1, w2, topk_weights, topk_ids, activation, reduce_results, skip_invalid,
-      sorted_token_ids, expert_ids, num_tokens_post_padded, alignment_block_m):
-    if reduce_results:
-        return torch.empty_like(hidden_states)
-    tokens, hidden = hidden_states.shape
-    return hidden_states.new_empty((tokens, topk_ids.shape[1], hidden))
-
-
 def fused_experts_fp8(
     hidden_states: torch.Tensor,
     w1_fp8: torch.Tensor,
@@ -290,6 +320,11 @@ def fused_experts_fp8(
         Shape ``(tokens, hidden)`` in ``hidden_states.dtype`` if
         ``reduce_results`` else ``(tokens, top_k, hidden)``.
     """
+    if not torch.compiler.is_compiling():  # as fused_experts: the op only where dynamo traces
+        return _fused_experts_fp8_impl(
+            hidden_states, w1_fp8, w2_fp8, w1_scale_inv, w2_scale_inv, topk_weights, topk_ids,
+            tuple(block_size), activation, reduce_results, swiglu_limit,
+        )
     return torch.ops.mstar.fused_experts_fp8(
         hidden_states, w1_fp8, w2_fp8, w1_scale_inv, w2_scale_inv, topk_weights, topk_ids,
         list(block_size), activation, reduce_results, swiglu_limit,
@@ -321,10 +356,7 @@ def _fused_experts_fp8_op(
 @_fused_experts_fp8_op.register_fake
 def _(hidden_states, w1_fp8, w2_fp8, w1_scale_inv, w2_scale_inv, topk_weights, topk_ids,
       block_size, activation, reduce_results, swiglu_limit):
-    if reduce_results:
-        return torch.empty_like(hidden_states)
-    tokens, hidden = hidden_states.shape
-    return hidden_states.new_empty((tokens, topk_ids.shape[1], hidden))
+    return _moe_output_like(hidden_states, topk_ids, reduce_results)
 
 
 def _fused_experts_fp8_impl(

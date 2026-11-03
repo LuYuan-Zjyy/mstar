@@ -8,7 +8,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from mstar.utils.fused_moe import fused_experts_fp8  # noqa: E402
+import mstar.utils.fused_moe  # noqa: E402, F401 -- registers mstar::fused_experts_fp8
 
 
 def _fake_args(tokens: int):
@@ -25,8 +25,8 @@ def test_registered_as_one_op():
 
 @pytest.mark.parametrize("reduce_results", [True, False])
 def test_fake_impl_shapes(reduce_results):
+    # the op itself: eager, fused_experts_fp8 calls the implementation
     with FakeTensorMode():
-        out = fused_experts_fp8(*_fake_args(37), block_size=(128, 128),
-                                reduce_results=reduce_results)
+        out = torch.ops.mstar.fused_experts_fp8(*_fake_args(37), [128, 128], "silu", reduce_results, None)
     assert out.shape == ((37, 256) if reduce_results else (37, 2, 256))
     assert out.dtype == torch.bfloat16
