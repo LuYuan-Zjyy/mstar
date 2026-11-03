@@ -144,13 +144,16 @@ class Resource(ABC):
         """Why a node holding this resource can't run on resident tables, or None if it can."""
         return f"{type(self).__name__} keeps no resident table"
 
-    def bind_resident(self, planner: "ResidentPlanner") -> None:
-        """Declare this resource's tables on the node's planner, once, at load."""
+    def bind_resident(self, planner: "ResidentPlanner", key: str) -> None:
+        """Declare this resource's tables on the node's planner, once, at load.
+        ``key`` is its resource key, which names its stream in each step's
+        `ResidentWrites.labels` and `CapturedResidentStep.labels`."""
         return
 
     def resident_row(self, rid: int, slot: int, row: list[int], writes: "ResidentWrites") -> None:
         """Set this resource's cells of ``rid``'s row: it is new or stale. ``row``
-        has the planner's narrow columns; the owner of the wide table appends."""
+        has the planner's narrow columns; the owner of a wide table queues its
+        cells as a run (`ResidentWrites.run`)."""
         return
 
     def resident_stage(self, plan: "ResidentPlan") -> None:

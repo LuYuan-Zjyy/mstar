@@ -14,7 +14,6 @@ from mstar.engine.resources.resident import (
     ResidentWrites,
     advance_column,
     gather_column,
-    scatter_cells,
 )
 
 _NO_INDICES = torch.empty(0, dtype=torch.int32)
@@ -34,15 +33,18 @@ def _gather_write_slots_kernel(
 class KVResidentTables:
     """``block_table[slot, col]`` is a stream's col-th page, ``kv_len[slot]`` its
     stored length: what a step appending one token per row reads to find where
-    it writes and what it attends to.
+    it writes and what it attends to. A step that only reads the stream (a
+    context at span 0) gathers the lengths and leaves the table as it is.
 
     The stream stays the truth. ``host_len`` advances by the rule the graph
     does, so nothing comes back from the device, and ``host_cols`` counts the
     columns a row holds, which is how the host sees a crossing.
     """
 
-    def __init__(self, planner: ResidentPlanner, page_size: int, max_pages: int):
+    def __init__(self, planner: ResidentPlanner, key: str, page_size: int, max_pages: int):
         self.planner = planner
+        self.key = key
+        planner.kv_pools.append(key)
         self.page_size = page_size
         self.block_table = planner.table(max_pages)
         self.kv_len = planner.table()
@@ -50,12 +52,13 @@ class KVResidentTables:
         self.host_cols = np.zeros(planner.max_slots, dtype=np.int64)
         self._qo_indptr: dict[int, torch.Tensor] = {}
 
-    def row(self, stored_len: int, pages: list[int], slot: int, row: list[int]) -> None:
-        """The cells of a stream about to append one token. Its host mirrors
-        move here, not at the flush: a plan that never runs leaves the row stale."""
+    def row(self, stored_len: int, pages: list[int], slot: int, row: list[int], writes: ResidentWrites) -> None:
+        """The cells of a stream about to append one token, or to be read. Its
+        host mirrors move here, not at the flush: a plan that never runs leaves
+        the row stale."""
         cols = stored_len // self.page_size + 1
         row[self.kv_len.col] = stored_len
-        row.extend(pages[:cols])
+        writes.run(self.block_table.cell(slot), pages[:cols])
         self.host_len[slot] = stored_len
         self.host_cols[slot] = cols
 
@@ -69,7 +72,9 @@ class KVResidentTables:
         column, rides the graph's scatter, ahead of its gather: only columns
         past the row's length change, so a step still replaying reads none of
         them. A row further behind (a host-planned step took its pages) is
-        rewritten whole."""
+        rewritten whole. A stream the step only reads never moves."""
+        if self.key in plan.writes.reads:
+            return
         slots = plan.slots
         cols = self.host_cols[slots]
         need = self.host_len[slots] // self.page_size + 1
@@ -83,7 +88,7 @@ class KVResidentTables:
                 rewrite(rid, slot, plan.writes)
             else:
                 plan.writes.put(self.block_table.cell(slot, last), stream_pages(rid)[last])
-        plan.crossed = (rows, need[rows])
+        plan.crossed[self.key] = (rows, need[rows])
 
     def decode_indptrs(self, plan: ResidentPlan, bs: int) -> PagedIndptrs:
         """The host half of a step whose graph builds the page arrays: each
@@ -110,19 +115,26 @@ class KVResidentTables:
         )
 
     def advance(self, plan: ResidentPlan) -> None:
+        if self.key in plan.writes.reads:
+            return
         self.host_len[plan.slots] += 1
-        if plan.crossed is not None:
-            rows, need = plan.crossed
+        crossed = plan.crossed.get(self.key)
+        if crossed is not None:
+            rows, need = crossed
             self.host_cols[plan.slots[rows]] = need
 
-    def gather(self, step: CapturedResidentStep, token_to_page: torch.Tensor, token_to_cache: torch.Tensor) -> None:
+    def gather(
+        self, step: CapturedResidentStep, token_to_page: torch.Tensor | None, token_to_cache: torch.Tensor | None,
+    ) -> None:
+        """The rows' lengths, and where each appends unless the step only reads.
+        The planner has scattered the step's single cells."""
         store, table = self.planner.store, self.block_table
         stride, page_size = table.stride, self.page_size
-        step.store, step.block_table = store, table
-        # before the reads: a row that crossed writes into its new page
-        scatter_cells(store, step.buffers.cells)
-        kv_len = step.buffers.kv_len
+        step.block_tables[self.key] = table
+        kv_len = step.buffers.kv_len[self.key]
         gather_column(store, step.slots, stride, self.kv_len.col, kv_len)
+        if self.key in step.reads:
+            return
         if store.is_cuda:
             _gather_write_slots_kernel[(step.bucket.bs,)](
                 step.slots, kv_len, store, token_to_page, token_to_cache,
@@ -135,4 +147,5 @@ class KVResidentTables:
         token_to_cache[:bs].copy_(kv_len - col * page_size)
 
     def commit(self, step: CapturedResidentStep) -> None:
-        advance_column(self.planner.store, step.slots, self.kv_len.stride, self.kv_len.col)
+        if self.key not in step.reads:
+            advance_column(self.planner.store, step.slots, self.kv_len.stride, self.kv_len.col)

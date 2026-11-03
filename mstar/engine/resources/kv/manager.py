@@ -2857,10 +2857,10 @@ class KVManager(AttentionResource):
         self.reset_default_cursors()
         if ctx.resident is not None:
             bucket = ctx.slot_lease.bucket
-            if bucket in ctx.resident.host_plan_free:
+            if (bucket, self._resident.key) in ctx.resident.host_plan_free:
                 # nothing reads a plan of this step, and its graph fills the addressing
                 return KVPlanOutputs({})
-            if bucket in ctx.resident.lengths_only:
+            if (bucket, self._resident.key) in ctx.resident.lengths_only:
                 # its graph fills the addressing and the attention's page arrays;
                 # a promoted step keeps the resident plan its pre-plan staged
                 plan = ctx.resident_plan
@@ -2868,7 +2868,9 @@ class KVManager(AttentionResource):
                 if held is not None and held[0] is plan:
                     return held[1]
                 out = KVPlanOutputs({
-                    plan.writes.label: KVPlanOutput(self._resident.decode_indptrs(plan, bucket.bs)),
+                    plan.writes.labels[self._resident.key]: KVPlanOutput(
+                        self._resident.decode_indptrs(plan, bucket.bs),
+                    ),
                 })
                 self._lengths_plan = (plan, out)
                 return out
@@ -4526,24 +4528,27 @@ class KVManager(AttentionResource):
             return "a pool read across nodes takes pages a resident row doesn't track"
         return None
 
-    def bind_resident(self, planner: "ResidentPlanner") -> None:
+    def bind_resident(self, planner: "ResidentPlanner", key: str) -> None:
         from mstar.engine.resources.kv.resident import KVResidentTables
 
         page_size = self._groups[0].page_size
-        self._resident = KVResidentTables(planner, page_size, -(-self.config.max_seq_len // page_size))
+        self._resident = KVResidentTables(planner, key, page_size, -(-self.config.max_seq_len // page_size))
 
     def resident_row(self, rid: int, slot: int, row: list[int], writes: "ResidentWrites") -> None:
-        stream = self._streams[rid][writes.label]
+        key = self._resident.key
+        label = writes.labels[key]
+        stream = self._streams[rid][label]
         if stream.released:
             raise ValueError(
-                f"KV {self.name}: {rid}/{writes.label} released {stream.released} tokens, "
+                f"KV {self.name}: {rid}/{label} released {stream.released} tokens, "
                 "which a block table row can't address"
             )
-        writes.kv_len = stream.stored_len
-        self._resident.row(stream.stored_len, stream.page_indices, slot, row)
+        writes.kv_len[key] = stream.stored_len
+        self._resident.row(stream.stored_len, stream.page_indices, slot, row, writes)
 
     def resident_stage(self, plan: "ResidentPlan") -> None:
-        tables, streams, label = self._resident, self._streams, plan.writes.label
+        tables, streams = self._resident, self._streams
+        label = plan.writes.labels[tables.key]
         planner = tables.planner
         for rid in plan.moved:
             tables.refresh_len(streams[rid][label].stored_len, planner.slot_of(rid), plan.writes)
@@ -4554,8 +4559,12 @@ class KVManager(AttentionResource):
                 assert held == stored, f"KV {self.name}: resident row of {rid} at {held}, its stream at {stored}"
 
     def resident_gather(self, step: "CapturedResidentStep") -> None:
-        state = self._static_plan_state(step.slot, (step.label, 0))
-        self._resident.gather(step, state.token_to_page, state.token_to_cache)
+        tables = self._resident
+        if tables.key in step.reads:
+            tables.gather(step, None, None)
+            return
+        state = self._static_plan_state(step.slot, (step.labels[tables.key], 0))
+        tables.gather(step, state.token_to_page, state.token_to_cache)
 
     def resident_commit(self, step: "CapturedResidentStep") -> None:
         self._resident.commit(step)

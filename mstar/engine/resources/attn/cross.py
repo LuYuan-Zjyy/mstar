@@ -122,6 +122,8 @@ class FlashInferCrossManager(CrossAttentionManager):
         self._preplanned = False
         # wrapper key (EagerSlotKey, or CGSlotKey under capture) -> its last plan
         self._last_plans: dict[Any, _LastPlan] = {}
+        # a resident step's query indptr, by row count
+        self._qo_indptr: dict[int, torch.Tensor] = {}
 
         self._kv_config = kv_config
         self._wrapper_kv_kwargs = dict(
@@ -135,6 +137,12 @@ class FlashInferCrossManager(CrossAttentionManager):
         )
 
         self._workspaces = WorkspacePool(device)
+
+    def resident_refusal(self) -> str | None:
+        # the context pool's resident row is read only; it plans its views on the host
+        if self._query_kv_cache_name == self._kv_cache_name:
+            return "a context in the query's own pool is a second stream in a pool's resident row"
+        return None
 
     def depends_on(self):
         # a query side with no cache contributes no dependency: its packing
@@ -251,6 +259,15 @@ class FlashInferCrossManager(CrossAttentionManager):
     ) -> dict[str, QueryPacking]:
         if self._query_kv_cache_name is None:
             return self._step_query_packings(step)
+        if ctx.resident is not None:
+            # one query token a row, in the step's row order; the query pool's
+            # plan of a resident step may carry no views
+            rids = ctx.padded_request_ids
+            qo = self._qo_indptr.get(len(rids))
+            if qo is None:
+                qo = self._qo_indptr[len(rids)] = torch.arange(len(rids) + 1, dtype=torch.int32)
+            label = ctx.resident_plan.writes.labels[self._query_kv_cache_name]
+            return {label: QueryPacking(request_ids=list(rids), qo_indptr=qo)}
 
         plan_outputs: KVPlanOutputs = ctx.plan_results.get(
             self._query_kv_cache_name

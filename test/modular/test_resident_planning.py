@@ -37,6 +37,7 @@ from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepConte
 from mstar.utils import knobs  # noqa: E402
 
 PAGE = 4
+CONTEXT_LEN = 6
 WALK = "decode"
 CPU = torch.device("cpu")
 
@@ -60,7 +61,16 @@ def _stub_transfer(monkeypatch):
     monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
 
 
-def _resources(cpu_offload_pages: int = 0, max_num_pages: int = 64):
+def _context_pool():
+    pool = KVManager(
+        cfg=PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64, max_num_pages=64, page_size=PAGE),
+        name="ctx", joint_comm_group=None, transfer_engine_info=None, device=CPU, dtype=torch.float32,
+    )
+    pool._cg_max_seq_len = 64
+    return pool
+
+
+def _resources(cpu_offload_pages: int = 0, max_num_pages: int = 64, context: bool = False):
     kv = KVManager(
         cfg=PagedKVConfig(
             num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=512,
@@ -75,13 +85,25 @@ def _resources(cpu_offload_pages: int = 0, max_num_pages: int = 64):
     rope = RopeManager(PositionConfig(kv_cache="kv"), CPU, max_seq_len=512, head_dim=8)
     # page-locked memory needs a GPU, and nothing here copies out of it asynchronously
     rope._pinned_pos_ids_buffer = lambda key, n: torch.empty(n, dtype=torch.long)
-    return {"kv": kv, "pool": pool, "rope": rope}
+    res = {"kv": kv, "pool": pool, "rope": rope}
+    if context:
+        # a second pool, as Whisper's cross attention context: written by the
+        # prefill, read at span 0 by every decode step
+        res["ctx"] = _context_pool()
+    return res
 
 
 def _ingest(res: dict[str, Resource], rid: int) -> None:
     res["kv"].ingest_request(rid, KVReqConfig())
     res["pool"].ingest_request(rid, None)
     res["rope"].ingest_request(rid, None)
+    if "ctx" in res:
+        res["ctx"].ingest_request(rid, KVReqConfig())
+        step = KVStep(segments=(Segment(rid, "context", CONTEXT_LEN),))
+        ctx = StepContext(request_ids=(rid,), graph_walk="prefill", slot=0, capture=False)
+        assert res["ctx"].admit(step, ctx).ok
+        res["ctx"].plan(step, ctx)
+        res["ctx"].commit(step, ctx)
 
 
 def _host_step(res, rids, spans, walk="prefill", advance=None):
@@ -111,7 +133,12 @@ def _captured_step(res, planner: ResidentPlanner | None, rids, slot, bs, preplan
     ctx.set_padded_rids(padded)
     segments = tuple(Segment(r, "main", 1) for r in padded)
     kv, pool, rope = KVStep(segments=segments), RecurrentStep(segments=segments), PositionStep(segments=segments)
-    step = SubmoduleStep(steps={"kv": kv}, segments=list(segments))
+    steps = {"kv": kv}
+    context = None
+    if "ctx" in res:
+        context = steps["ctx"] = KVStep(segments=tuple(Segment(r, "context", 0) for r in padded))
+        assert res["ctx"].admit(context, ctx).ok
+    step = SubmoduleStep(steps=steps, segments=list(segments))
     assert res["kv"].admit(kv, ctx).ok
     assert res["pool"].admit(pool, ctx).ok
     # a capture's first plan builds the static buffers on the host
@@ -119,6 +146,8 @@ def _captured_step(res, planner: ResidentPlanner | None, rids, slot, bs, preplan
     if (bucket, slot) not in res.setdefault("captured", set()):
         res["captured"].add((bucket, slot))
         first.plan_results["kv"] = res["kv"].plan(kv, first)
+        if context is not None:
+            res["ctx"].plan(context, first)
         res["pool"].plan(pool, first)
         res["rope"].plan(rope, first)
     captured = None
@@ -130,10 +159,12 @@ def _captured_step(res, planner: ResidentPlanner | None, rids, slot, bs, preplan
         if planner is not None:
             planner.plan(step, ctx)
         ctx.plan_results["kv"] = res["kv"].plan(kv, ctx)
+        if context is not None:
+            ctx.plan_results["ctx"] = res["ctx"].plan(context, ctx)
         res["pool"].plan(pool, ctx)
         res["rope"].plan(rope, ctx)
         ctx.is_preplan = False
-    out = SimpleNamespace(step=step, ctx=ctx, kv=kv, pool=pool, rope=rope, captured=captured)
+    out = SimpleNamespace(step=step, ctx=ctx, kv=kv, pool=pool, rope=rope, context=context, captured=captured)
     if run:
         _replay(res, planner, out)
     return out
@@ -143,6 +174,8 @@ def _promote(res, planner, s):
     ctx = s.ctx
     planner.plan(s.step, ctx)
     ctx.plan_results["kv"] = res["kv"].plan(s.kv, ctx)
+    if s.context is not None:
+        ctx.plan_results["ctx"] = res["ctx"].plan(s.context, ctx)
     res["pool"].plan(s.pool, ctx)
     res["rope"].plan(s.rope, ctx)
 
@@ -161,9 +194,15 @@ def _replay(res, planner, s, promote=True):
     s.offsets = state.token_to_cache[: bucket.bs].tolist()
     s.positions = res["rope"]._static_pos_ids[ck][: bucket.bs].tolist()
     s.pool_slots = res["pool"]._cg_addressing[ck].slot_indices[: bucket.bs].tolist()
+    if s.context is not None:
+        s.context_views = [(v.request_id, v.length) for v in ctx.plan_results["ctx"]["context"].views]
+        if planner is not None:
+            s.context_len = s.captured.buffers.kv_len["ctx"].tolist()
     if planner is not None:
         planner.commit_in_graph(s.captured)
     res["kv"].commit(s.kv, ctx)
+    if s.context is not None:
+        res["ctx"].commit(s.context, ctx)
     res["pool"].commit(s.pool, ctx)
     res["rope"].commit(s.rope, ctx)
     if planner is not None:
@@ -171,10 +210,11 @@ def _replay(res, planner, s, promote=True):
     return s
 
 
-def _setup(prompts: dict[int, int], cpu_offload_pages: int = 0, max_num_pages: int = 64):
+def _setup(prompts: dict[int, int], cpu_offload_pages: int = 0, max_num_pages: int = 64, context: bool = False):
     """The same requests prefilled on resident resources and on a host-planned reference."""
-    live, ref = _resources(cpu_offload_pages, max_num_pages), _resources(cpu_offload_pages, max_num_pages)
-    planner = ResidentPlanner("n", {WALK}, {k: live[k] for k in ("kv", "pool", "rope")}, CPU, max_slots=8)
+    live, ref = (_resources(cpu_offload_pages, max_num_pages, context) for _ in range(2))
+    owners = {k: live[k] for k in ("kv", "pool", "rope", "ctx") if k in live}
+    planner = ResidentPlanner("n", {WALK}, owners, CPU, max_slots=8)
     for res in (live, ref):
         for rid, n in prompts.items():
             _ingest(res, rid)
@@ -541,16 +581,15 @@ def test_the_captured_kernels_match_the_torch_ops():
         gather_column(store, slots, 7, 2, small, plus=out)
         advance_column(store, slots, 7, 1)
         tables = SimpleNamespace(
-            planner=SimpleNamespace(store=store), page_size=4,
+            planner=SimpleNamespace(store=store), page_size=4, key="kv",
             block_table=SimpleNamespace(stride=7, col=3), kv_len=SimpleNamespace(stride=7, col=1),
         )
         store[slots * 7 + 1] = torch.tensor([9, 5, 0, 0], device=device)
         pages = torch.zeros(4, dtype=torch.long, device=device)
         offsets = torch.zeros(4, dtype=torch.long, device=device)
         step = SimpleNamespace(
-            slots=slots, bucket=SimpleNamespace(bs=4), buffers=SimpleNamespace(
-                cells=torch.zeros((2, 8), dtype=torch.long, device=device), kv_len=out,
-            ),
+            slots=slots, bucket=SimpleNamespace(bs=4), reads=frozenset(), block_tables={},
+            buffers=SimpleNamespace(kv_len={"kv": out}),
         )
         KVResidentTables.gather(tables, step, pages, offsets)
         return [t.tolist() for t in (store, out, small, pages, offsets)]
@@ -783,7 +822,6 @@ def test_a_pool_without_a_sink_refuses():
 
 
 @pytest.mark.parametrize("module,name", [
-    ("mstar.engine.resources.attn.cross", "CrossAttentionManager"),
     ("mstar.engine.resources.kv.bounded.manager", "BoundedKVManager"),
     ("mstar.engine.resources.attn.dense", "DenseAttentionManager"),
     ("mstar.engine.resources.attn.flashinfer_mla", "FlashInferMLAManager"),
@@ -796,6 +834,83 @@ def test_resources_with_no_table_keep_the_base_refusal(module, name):
 
     cls = getattr(importlib.import_module(module), name)
     assert cls.resident_refusal is Resource.resident_refusal
+
+
+# ---- a second pool, read at span 0 ----
+
+def _cross(context="ctx", query="kv"):
+    from mstar.engine.resources.attn.cross import FlashInferCrossManager
+
+    cross = FlashInferCrossManager.__new__(FlashInferCrossManager)
+    cross._kv_cache_name, cross._query_kv_cache_name = context, query
+    cross._qo_indptr = {}
+    return cross
+
+
+def test_two_pools_bind_rows_of_their_own():
+    res = _resources(context=True)
+    planner, why = _build({**res, "cross": _cross()})
+    assert planner is not None, why
+    assert planner.kv_pools == ["kv", "ctx"]
+    kv, ctx = res["kv"]._resident, res["ctx"]._resident
+    assert kv.block_table.col != ctx.block_table.col and kv.kv_len.col != ctx.kv_len.col
+
+
+def test_a_context_in_the_query_pool_refuses():
+    planner, why = _build({"kv": _resources()["kv"], "cross": _cross(context="kv", query="kv")})
+    assert planner is None and "query's own pool" in why
+
+
+@pytest.mark.parametrize("lengths_only", [False, True])
+def test_a_pool_the_step_only_reads_keeps_its_row_and_its_host_plan(lengths_only):
+    """Whisper's decoder: the self-attention pool appends a token a row, the
+    context pool is read at span 0. Both rows come off the tables, the read
+    one never moves, and the context pool still plans the views its cross
+    attention reads, beside a pool whose attention builds its own page arrays."""
+    live, ref, planner = _setup({1: 3, 2: 5}, context=True)
+    if lengths_only:
+        planner.lengths_only.add((BucketKey(graph_walk=WALK, bs=4, num_tokens=4), "kv"))
+    for t in range(10):
+        a = _captured_step(live, planner, [1, 2], slot=t % 2, bs=4)
+        b = _captured_step(ref, None, [1, 2], slot=t % 2, bs=4)
+        _same(a, b, real=2)
+        assert a.context_len[:2] == [CONTEXT_LEN] * 2
+        assert a.context_views[:2] == b.context_views[:2] == [(1, CONTEXT_LEN), (2, CONTEXT_LEN)]
+    tables = live["ctx"]._resident
+    for rid in (1, 2):
+        slot = planner.slot_of(rid)
+        pages = live["ctx"]._streams[rid]["context"].page_indices
+        assert int(tables.kv_len.view[slot, 0]) == tables.host_len[slot] == CONTEXT_LEN
+        assert tables.block_table.view[slot, :2].tolist() == pages[:2]
+        _assert_row(planner, live, rid)
+
+
+@pytest.mark.parametrize("context,copies", [(False, 1), (True, 2)])
+def test_a_rewritten_row_is_a_copy_per_pool(monkeypatch, context, copies):
+    """A row's narrow cells and its first block table are contiguous, so one
+    pool's rewrite stays one copy; a second pool's table is one more."""
+    live, _, planner = _setup({1: 3, 2: 5}, context=context)
+    seen = []
+    real = planner._stager.copy_runs_
+    monkeypatch.setattr(
+        planner._stager, "copy_runs_", lambda dsts, values: (seen.append(len(dsts)), real(dsts, values)),
+    )
+    _captured_step(live, planner, [1, 2], slot=0, bs=4)
+    assert seen == [2 * copies]
+
+
+def test_a_resident_step_packs_cross_attention_queries_as_the_host_plan_does():
+    from mstar.engine.resources.attn.config import AttentionStep
+
+    live, ref, planner = _setup({1: 3, 2: 5, 3: 8})
+    a = _captured_step(live, planner, [1, 2, 3], slot=0, bs=4, run=False)
+    _promote(live, planner, a)
+    b = _captured_step(ref, None, [1, 2, 3], slot=0, bs=4, run=False)
+    cross = _cross()
+    got, want = cross._query_packings(AttentionStep(), a.ctx), cross._query_packings(AttentionStep(), b.ctx)
+    assert got.keys() == want.keys() == {"main"}
+    assert list(got["main"].request_ids) == list(want["main"].request_ids)
+    assert got["main"].qo_indptr.tolist() == want["main"].qo_indptr.tolist()
 
 
 def test_flashinfer_refuses_a_sliding_window():

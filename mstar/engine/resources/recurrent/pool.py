@@ -1125,15 +1125,16 @@ class RecurrentStatePool(Resource):
             return "a pool with no sink slot has nowhere for a padding row"
         return None
 
-    def bind_resident(self, planner: "ResidentPlanner") -> None:
+    def bind_resident(self, planner: "ResidentPlanner", key: str) -> None:
         self._resident = planner
+        self._resident_key = key
         self._resident_table = planner.table()
 
     def resident_row(self, rid: int, slot: int, row: list[int], writes: "ResidentWrites") -> None:
-        row[self._resident_table.col] = self._slots[rid][writes.label].index
+        row[self._resident_table.col] = self._slots[rid][writes.labels[self._resident_key]].index
 
     def resident_gather(self, step: "CapturedResidentStep") -> None:
-        key = CGSlotKey(bucket=step.bucket, slot=step.slot, label=step.label)
+        key = CGSlotKey(bucket=step.bucket, slot=step.slot, label=step.labels[self._resident_key])
         table = self._resident_table
         # a padding row reads the trash row's zero, which is SINK_SLOT
         gather_column(self._resident.store, step.slots, table.stride, table.col, self._cg_addressing[key].slot_indices)

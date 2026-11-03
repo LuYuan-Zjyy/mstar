@@ -29,7 +29,7 @@ from mstar.engine.resources.step import SlotLease, StepContext
 from mstar.utils.profiler import PhaseLaps
 
 if TYPE_CHECKING:
-    from mstar.engine.resources.resident import CapturedResidentStep
+    from mstar.engine.resources.resident import CapturedResidentStep, ResidentPlanner
 
 
 class FlashInferManager(AttentionManager):
@@ -103,17 +103,22 @@ class FlashInferManager(AttentionManager):
             return "a sliding window reads pages a resident row no longer holds"
         return None
 
+    def bind_resident(self, planner: "ResidentPlanner", key: str) -> None:
+        self._resident_key = key
+
     def resident_gather(self, step: "CapturedResidentStep") -> None:
-        wrapper = self._cg_plan_states.get(CGSlotKey(bucket=step.bucket, slot=step.slot, label=step.label))
+        label = step.labels[self._resident_key]
+        wrapper = self._cg_plan_states.get(CGSlotKey(bucket=step.bucket, slot=step.slot, label=label))
+        pool = self._kv_cache_name
         if isinstance(wrapper, FmhaDecodeWrapper):
-            table = step.block_table
-            wrapper.gather_resident(step.store, step.slots, step.buffers.kv_len, table.stride, table.col)
-            step.host_plan_free = True
+            table = step.block_tables[pool]
+            wrapper.gather_resident(step.store, step.slots, step.buffers.kv_len[pool], table.stride, table.col)
+            step.host_plan_free.add(pool)
         elif isinstance(wrapper, FlashInferDecodeWrapper) and wrapper.schedules_alone:
             # the paged arrays come off the tables; the host plans the schedule alone
-            table = step.block_table
-            wrapper.gather_resident(step.store, step.slots, step.buffers.kv_len, table.stride, table.col)
-            step.lengths_only = True
+            table = step.block_tables[pool]
+            wrapper.gather_resident(step.store, step.slots, step.buffers.kv_len[pool], table.stride, table.col)
+            step.lengths_only.add(pool)
 
     def _check_layer(self, layer_idx: int) -> None:
         """Over a pool of more than one group, ``layer_idx`` must be a layer this attention runs,
@@ -250,7 +255,7 @@ class FlashInferManager(AttentionManager):
         return True
 
     def plan(self, step: AttentionStep, ctx: StepContext):
-        if ctx.resident is not None and ctx.slot_lease.bucket in ctx.resident.host_plan_free:
+        if ctx.resident is not None and (ctx.slot_lease.bucket, self._kv_cache_name) in ctx.resident.host_plan_free:
             return
         refuse_context_only(step, type(self).__name__)
         if self._window_left >= 0 and not step.causal:
@@ -295,7 +300,7 @@ class FlashInferManager(AttentionManager):
                 )
                 wrapper = self._eager_wrapper(label, is_decode, ctx.slot)
 
-            if ctx.resident is not None and lease.bucket in ctx.resident.lengths_only:
+            if ctx.resident is not None and (lease.bucket, self._kv_cache_name) in ctx.resident.lengths_only:
                 wrapper.plan_schedule(indptrs.paged_kv_indptr, indptrs.kv_lens)
                 laps.lap("schedule")
                 plan_states[label] = wrapper
