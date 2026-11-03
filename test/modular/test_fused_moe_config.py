@@ -80,7 +80,7 @@ def test_a_dynamic_compile_keeps_fused_experts_opaque(reduce_results):
 )
 def test_fused_experts_traces_with_a_symbolic_batch_on_every_table(table, monkeypatch):
     """An uncaptured step compiles fused_experts with a dynamic batch size, and
-    every entry of a shipped table must trace that way (launch options included)."""
+    every entry of a shipped table must launch under it."""
     import re
 
     from mstar.utils.fused_moe import fused_experts
