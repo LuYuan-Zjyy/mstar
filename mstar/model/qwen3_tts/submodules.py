@@ -520,6 +520,10 @@ class TalkerSubmodule(ARNodeSubmodule):
             "suppress_eos": self._get_batch_suppress_eos(inputs),
         }
 
+    def resident_walks(self) -> frozenset[str]:
+        # one token a row in the main stream; `preprocess` reads no planned position or KV location
+        return frozenset({"talker_decode"})
+
     def declare_step(
         self,
         graph_walk: str,
