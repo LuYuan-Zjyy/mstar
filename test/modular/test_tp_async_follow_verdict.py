@@ -53,12 +53,18 @@ WALK = "decode"
 class _FakeEngineManager:
     def __init__(self, cache_open: bool = False):
         self.cache_open = cache_open
+        self.replayed = []
 
     def get_engine(self, node_name):
         return types.SimpleNamespace(
             check_ready=lambda *a: FULL_ADMIT_OK, drop_cached_prefix=lambda head: None,
-            prefix_cache_open=lambda node: self.cache_open,
+            prefix_cache_open=lambda node: self.cache_open, apply_resident_delta=self._land,
         )
+
+    def _land(self, node_name, delta):
+        """Lands every move of ``delta`` at once."""
+        self.replayed += delta.take().rids
+        return True
 
 
 class _Communicator:
@@ -280,6 +286,21 @@ def test_a_head_for_a_closed_step_is_queued_as_a_step_of_moves_alone():
     assert head is not None and (head.spec_seq, head.request_ids, head.speculative) == (5, [], False), (
         "the follower skipped rank 0's step"
     )
+
+
+def test_the_serial_path_lands_a_step_of_moves_alone_and_builds_nothing():
+    """Taking the step is what lets the removals rank 0 stamped with its seq go ahead."""
+    s = _stub()
+    s._close_tp_follow_step(_pending(4))
+    late = _head(["r0"], seq=5, from_seq=4)
+    late.resident_delta.add_offloaded("v")
+    s._register_tp_follow(late)
+
+    assert s.scheduler._try_schedule_tp_follow(request_state=None) is None, (
+        "a step with no rows was built as an empty batch"
+    )
+    assert s.scheduler.peek_tp_follow() is None and s.engine_manager.replayed == ["v"], "rank 0's move never landed"
+    assert s.scheduler.last_consumed_tp_seq == 5, "a removal rank 0 stamped with seq 5 would wait for the next step"
 
 
 def test_close_turns_a_queued_head_for_that_step_only_into_a_step_of_moves_alone():

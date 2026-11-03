@@ -6,7 +6,9 @@ speculation that was built but never submitted.
   them off a ``ScheduledBatch`` field that no longer exists.
 * A speculation that never reached the GPU thread holds rids that came off
   their ready queues; when the iteration raises they go back, whether or not
-  a pre-plan was armed (none is without pre-plan, or after a refusal reset).
+  a pre-plan was armed (none is without pre-plan, or after a refusal reset),
+  and on a TP follower, which counts a head's rows as in flight once it
+  builds the head, as on rank 0.
 * A terminal refusal (``AdmitRuntimeError``) fails the requests it names
   instead of re-queueing the step for ever; a full ring KV pool is retryable
   and holds only the request that waits.
@@ -136,6 +138,27 @@ def test_a_submitted_speculation_fails_with_its_step():
 
     assert w._graph_runtime.pushed == []
     assert set(w.reported) == {1, 2, 3, 4}
+
+
+def test_a_follower_gives_back_the_fresh_rows_of_the_head_it_built_when_the_step_under_it_raised():
+    """Step N holds 1. The follower built rank 0's head of 1 (continuing) and 2 (fresh), which put both among its
+    rows in flight, and then N's forward raised. Rank 0 never submitted its head, so it fails 1 with N and pushes 2
+    back. The follower has to do the same."""
+    w = _worker(follower=True)
+    pending = _pending([1])
+    head = Speculation(
+        scheduled_batch=_scheduled([1, 2]), node_batch=_executing([1, 2]),
+        consumed_edges=set(), continuing_rids={1}, partition="p",
+        is_new_iter=False, is_same_node=True,
+    )
+    w._in_flight_rids = {1, 2}
+
+    w._handle_main_loop_error(RuntimeError("boom"), (pending, None), None, head)
+
+    assert (set(w.reported), w._graph_runtime.pushed) == ({1}, [2]), (
+        f"the follower failed {sorted(w.reported)} and pushed back {w._graph_runtime.pushed}, where rank 0 fails "
+        "[1] and pushes back [2]"
+    )
 
 
 # ── terminal refusals ───────────────────────────────────────────────────
