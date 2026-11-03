@@ -72,12 +72,19 @@ class SamplerResource(Resource):
             self._stop_ids = torch.tensor(
                 sorted(set(min_tokens_stop_ids)), dtype=torch.long, device=device,
             )
+        # Decided once for the node, so its eager and captured steps draw through
+        # the same kernel: fused_sample (small vocabularies) lacks these processors,
+        # so a node that enables one draws through FlashInfer, asked for or not.
+        self._fused_draw = not (
+            enable_min_p or self._history is not None or enable_top_p_first or enable_processed_logprobs
+        )
         self._sampler = Sampler(
             device=device,
             tp_group=comm_group,
             history=self._history,
             stop_ids=self._stop_ids,
             enable_top_p_first=enable_top_p_first,
+            fused_draw=self._fused_draw,
         )
         # Two flags, because they have different lifetimes.
         #
@@ -200,6 +207,7 @@ class SamplerResource(Resource):
             ingraph_scatter=self._keep_last_token and sampler_ingraph_scatter() and self._decides,
             loopback_state=self._loopback_state,
             enable_logprobs=self._enable_logprobs,
+            fused_draw=self._fused_draw,
         )
 
     def ingest_request(self, rid: str, overrides: SamplingReqConfig | None=None):
